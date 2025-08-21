@@ -67,9 +67,10 @@ _deps = [
     "ruff>=0.9.0",
     "safetensors>=0.3.3",
     "sentencepiece>=0.1.99",
-    "torch==2.6.0",
+#    "torch>=2.6.0",
     "transformers==4.52.3",
-    "trl[vllm]==0.18.0",
+    # "trl[vllm]==0.18.0",
+    "trl",
     "wandb>=0.19.1",
     "async-lru>=2.0.5",
     "aiofiles>=24.1.0",
@@ -91,7 +92,7 @@ def deps_list(*pkgs):
 
 extras = {}
 extras["tests"] = deps_list("pytest", "parameterized", "math-verify", "jieba")
-extras["torch"] = deps_list("torch")
+#extras["torch"] = deps_list("torch")
 extras["quality"] = deps_list("ruff", "isort", "flake8")
 extras["code"] = deps_list("e2b-code-interpreter", "python-dotenv", "morphcloud", "jieba", "pandas", "aiofiles")
 extras["eval"] = deps_list("lighteval", "math-verify")

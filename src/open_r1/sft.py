@@ -31,11 +31,18 @@ accelerate launch --config_file=recipes/accelerate_configs/zero3.yaml src/open_r
     --bf16 \
     --use_liger_kernel \
     --output_dir data/OpenR1-Distill-7B
+
+accelerate launch --config_file=recipes/accelerate_configs/fsdp.yaml src/open_r1/sft.py \
+    --model_name_or_path /home/stepyoun/projects/sparse-cot/duo_attn/hybrid_model/DeepSeek-R1-Distill-Llama-8B-Untrained \
+    --dataset_name open-r1/Mixture-of-Thoughts \
+    --dataset_config all     --learning_rate 4.0e-5     --num_train_epochs 5     --max_seq_length 16384     --per_device_train_batch_size 1 \
+    --bf16  True   --use_liger_kernel  --output_dir data/r1-8B-10000 2>&1 | tee aug20.10000.log
 """
 
 import logging
 import os
 import sys
+import torch
 
 import datasets
 import transformers
@@ -48,8 +55,75 @@ from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import ModelConfig, SFTTrainer, TrlParser, get_peft_config, setup_chat_format
 
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    GenerationConfig,
+)
+
+from duo_attn.patch import enable_duo_attention_eval, enable_duo_attention_sft
+from duo_attn.utils import (
+    to_device,
+    load_attn_pattern,
+    sparsify_attention_heads,
+)
+from duo_attn.patch.tuple_kv_cache import enable_tuple_kv_cache
+import json
 
 logger = logging.getLogger(__name__)
+
+def load_model_and_tokenizer(path, model_name, max_seq_len, args):
+    tokenizer = AutoTokenizer.from_pretrained(
+        path, trust_remote_code=True, use_fast=False
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        path,
+        trust_remote_code=True,
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
+        attn_implementation="eager",
+    )
+
+    generation_config = GenerationConfig.from_pretrained(path)
+    eos_token_ids = generation_config.eos_token_id
+    if not isinstance(eos_token_ids, list):
+        eos_token_ids = [eos_token_ids]
+
+    model = model.eval()
+
+    assert args.attn_load_dir is not None, "attn_load_dir must be provided"
+    print(
+        f"Loading attention pattern from {args.attn_load_dir} with sparsity {args.sparsity}"
+    )
+    full_attention_heads, sink_size, recent_size = load_attn_pattern(
+        args.attn_load_dir
+    )
+
+    if args.sink_size is not None:
+        sink_size = args.sink_size
+    if args.recent_size is not None:
+        recent_size = args.recent_size
+
+    full_attention_heads, sparsity = sparsify_attention_heads(
+        full_attention_heads, None, sparsity=args.sparsity
+    )
+    print(f"True sparsity: {sparsity}")
+
+    enable_duo_attention_sft(
+        model,
+        full_attention_heads,
+        sink_size,
+        recent_size,
+        # 0, # query_size
+        # lm_eval=True,
+        # sparse_prefill=args.spattern if args.sparsity else "",
+        sparse_prefill=args.spattern if args.sparsity and (args.spattern.lower() != "none") else "",
+        # sparse_attn_implementation="flex",
+        sparse_attn_implementation="sdpa",
+        max_seq_len=max_seq_len,
+    )
+
+    return model, tokenizer, eos_token_ids
 
 
 def main(script_args, training_args, model_args):
@@ -64,6 +138,7 @@ def main(script_args, training_args, model_args):
         handlers=[logging.StreamHandler(sys.stdout)],
     )
     log_level = training_args.get_process_log_level()
+    log_level = logging.DEBUG
     logger.setLevel(log_level)
     datasets.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.set_verbosity(log_level)
@@ -89,8 +164,50 @@ def main(script_args, training_args, model_args):
     ######################################
     dataset = get_dataset(script_args)
     tokenizer = get_tokenizer(model_args, training_args)
-    model = get_model(model_args, training_args)
+    if True:
+        # model_name = model_args.model_name_or_path.split('/')[-1]
+        # model_args.attn_load_dir  = f"/home/stepyoun/projects/sparse-cot/attn_patterns/{model_name}/lr=0.02-reg=0.05-ctx=1000_16384-multi_passkey10"
+        # model_args.sparsity = 0.5
+        # model_args.sink_size = 256
+        # model_args.recent_size = 128
+        # model_args.spattern = "streaming"
+        # model, tokenizer, eos_token_ids = load_model_and_tokenizer(model_args.model_name_or_path, model_name, training_args.max_seq_length, model_args)
+        # # tokenizer.eos_token_id = eos_token_ids
+        from duo_attn.hybrid_model.hybrid_wrapper import SparseTransformerHybridModelWrapper, load_sparse_attn_config
+        from trl import ModelConfig, get_kbit_device_map, get_quantization_config
+        torch._dynamo.config.recompile_limit = 8192
+        torch_dtype = (
+            model_args.torch_dtype if model_args.torch_dtype in ["auto", None] else getattr(torch, model_args.torch_dtype)
+        )
+        # quantization_config = get_quantization_config(model_args)
+        model_kwargs = dict(
+            # revision=model_args.model_revision,
+            # trust_remote_code=model_args.trust_remote_code,
+            # attn_implementation=model_args.attn_implementation,
+            torch_dtype=torch_dtype,
+            # use_cache=False if training_args.gradient_checkpointing else True,
+            use_cache=False,
+            # device_map=get_kbit_device_map() if quantization_config is not None else None,
+            # quantization_config=quantization_config,
+        )
+        # model = AutoModelForCausalLM.from_pretrained(
+        #     model_args.model_name_or_path,
+        #     **model_kwargs,
+        # )
+        assert not training_args.gradient_checkpointing
+        model = SparseTransformerHybridModelWrapper.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+    else:
+        model = get_model(model_args, training_args)
 
+    if torch.distributed.get_rank() == 0:
+        logger.info(model_args)
+        logger.info(training_args)
+        logger.info(script_args)
+        logger.info(f"model=\n{model}")
+
+    # training_args.find_unused_parameters=True
+    training_args.gradient_checkpointing=False
+    training_args.use_cache=False
     if tokenizer.chat_template is None:
         logger.info("No chat template provided, defaulting to ChatML.")
         model, tokenizer = setup_chat_format(model, tokenizer, format="chatml")
@@ -101,8 +218,8 @@ def main(script_args, training_args, model_args):
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
+        train_dataset=dataset[script_args.dataset_train_split].select(range(10000)),
+        eval_dataset=(dataset[script_args.dataset_test_split].select(range(10000)) if training_args.eval_strategy != "no" else None),
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
@@ -112,6 +229,7 @@ def main(script_args, training_args, model_args):
     # Training loop
     ###############
     logger.info("*** Train ***")
+    torch.autograd.set_detect_anomaly(True)
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
         checkpoint = training_args.resume_from_checkpoint
