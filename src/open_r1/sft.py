@@ -125,6 +125,60 @@ def load_model_and_tokenizer(path, model_name, max_seq_len, args):
 
     return model, tokenizer, eos_token_ids
 
+# (c) Meta Platforms, Inc. and affiliates. 
+import logging
+import socket
+from datetime import datetime
+
+logging.basicConfig(
+   format="%(levelname)s:%(asctime)s %(message)s",
+   level=logging.INFO,
+   datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger: logging.Logger = logging.getLogger(__name__)
+logger.setLevel(level=logging.INFO)
+
+TIME_FORMAT_STR: str = "%b_%d_%H_%M_%S"
+
+# Keep a max of 100,000 alloc/free events in the recorded history
+# leading up to the snapshot.
+MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT: int = 100000
+
+def start_record_memory_history() -> None:
+   if not torch.cuda.is_available():
+       logger.info("CUDA unavailable. Not recording memory history")
+       return
+
+   logger.info("Starting snapshot record_memory_history")
+   torch.cuda.memory._record_memory_history(
+       max_entries=MAX_NUM_OF_MEM_EVENTS_PER_SNAPSHOT
+   )
+
+def stop_record_memory_history() -> None:
+   if not torch.cuda.is_available():
+       logger.info("CUDA unavailable. Not recording memory history")
+       return
+
+   logger.info("Stopping snapshot record_memory_history")
+   torch.cuda.memory._record_memory_history(enabled=None)
+
+def export_memory_snapshot() -> None:
+   if not torch.cuda.is_available():
+       logger.info("CUDA unavailable. Not exporting memory snapshot")
+       return
+
+   # Prefix for file names.
+   host_name = socket.gethostname()
+   timestamp = datetime.now().strftime(TIME_FORMAT_STR)
+   file_prefix = f"{host_name}_{timestamp}"
+
+   try:
+       logger.info(f"Saving snapshot to local file: {file_prefix}.pickle")
+       torch.cuda.memory._dump_snapshot(f"{file_prefix}.pickle")
+   except Exception as e:
+       logger.error(f"Failed to capture memory snapshot {e}")
+       return
+
 
 def main(script_args, training_args, model_args):
     set_seed(training_args.seed)
@@ -196,6 +250,9 @@ def main(script_args, training_args, model_args):
         # )
         assert not training_args.gradient_checkpointing
         model = SparseTransformerHybridModelWrapper.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+        # model.model.use_cache = False
+        # if 'qwen' in model_args.model_name_or_path.lower():
+        tokenizer.padding_side  = 'left'
     else:
         model = get_model(model_args, training_args)
 
@@ -215,16 +272,43 @@ def main(script_args, training_args, model_args):
     ############################
     # Initialize the SFT Trainer
     ############################
+    # training_args.packing=True
+    # training_args.max_length=16384
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split].select(range(10000)),
-        eval_dataset=(dataset[script_args.dataset_test_split].select(range(10000)) if training_args.eval_strategy != "no" else None),
+        train_dataset=dataset[script_args.dataset_train_split].select(range(16384)),
+        eval_dataset=(dataset[script_args.dataset_test_split].select(range(16384)) if training_args.eval_strategy != "no" else None),
+        # train_dataset=dataset[script_args.dataset_train_split],
+        # eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
         processing_class=tokenizer,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
     )
 
+    # from torch.profiler import profile, record_function, ProfilerActivity
+    # if torch.distributed.get_rank() == 0:
+    #     start_record_memory_history()
+    #     with profile(activities=[ProfilerActivity.CUDA],
+    #         profile_memory=True, record_shapes=True) as prof:
+    #         ###############
+    #         # Training loop
+    #         ###############
+    #         logger.info("*** Train ***")
+    #         torch.autograd.set_detect_anomaly(True)
+    #         checkpoint = None
+    #         if training_args.resume_from_checkpoint is not None:
+    #             checkpoint = training_args.resume_from_checkpoint
+    #         elif last_checkpoint is not None:
+    #             checkpoint = last_checkpoint
+    #         train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    #     sort_metric = "self_cuda_memory_usage" if torch.cuda.is_available() else "self_cpu_memory_usage"
+    #     print(prof.key_averages().table(sort_by=sort_metric, row_limit=32))
+    #     # Create the memory snapshot file
+    #     export_memory_snapshot()
+    #     # Stop recording memory snapshot history
+    #     stop_record_memory_history()
+    
     ###############
     # Training loop
     ###############
@@ -248,7 +332,8 @@ def main(script_args, training_args, model_args):
     logger.info("*** Save model ***")
     # Align the model's generation config with the tokenizer's eos token
     # to avoid unbounded generation in the transformers `pipeline()` function
-    trainer.model.generation_config.eos_token_id = tokenizer.eos_token_id
+    # trainer.model.generation_config.eos_token_id = tokenizer.eos_token_id
+    trainer.model.model.generation_config.eos_token_id = tokenizer.eos_token_id
     trainer.save_model(training_args.output_dir)
     logger.info(f"Model saved to {training_args.output_dir}")
 
