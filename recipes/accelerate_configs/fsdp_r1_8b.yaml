@@ -1,6 +1,6 @@
 # Config for 1 node of 8 x MI300x
 # Model arguments
-model_name_or_path: model/DeepSeek-R1-Distill-Llama-8B-Untrained
+model_name_or_path: model/DeepSeek-R1-Distill-Llama-8B
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -32,7 +32,7 @@ max_grad_norm: 0.2
 max_length: 8192
 max_steps: -1
 num_train_epochs: 3
-output_dir: data/r1-8b-8k
+output_dir: data/org-r1-8b
 overwrite_output_dir: true
 per_device_eval_batch_size: 1
 per_device_train_batch_size: 2

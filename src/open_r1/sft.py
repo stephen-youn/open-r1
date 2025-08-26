@@ -43,6 +43,7 @@ import logging
 import os
 import sys
 import torch
+import numpy as np
 
 import datasets
 import transformers
@@ -71,6 +72,21 @@ from duo_attn.patch.tuple_kv_cache import enable_tuple_kv_cache
 import json
 
 logger = logging.getLogger(__name__)
+
+def save_config(sparse_attn_config, save_directory):
+    os.makedirs(save_directory, exist_ok=True)
+    config_path = os.path.join(save_directory, "sparse_attn_config.json")
+    def make_serializable(obj):
+        if isinstance(obj, (np.ndarray,)):
+            return obj.tolist()
+        if isinstance(obj, (torch.dtype,)):
+            # Return only the dtype name, e.g., "bfloat16"
+            return obj.__str__().replace("torch.", "")
+        return obj
+    serializable_dict = {k: make_serializable(v) for k, v in sparse_attn_config.__dict__.items()}
+    with open(config_path, "w") as f:
+        json.dump(serializable_dict, f, indent=4)
+    logging.info("Sparse Transformer configuration saved to %s", config_path)
 
 def load_model_and_tokenizer(path, model_name, max_seq_len, args):
     tokenizer = AutoTokenizer.from_pretrained(
@@ -218,7 +234,8 @@ def main(script_args, training_args, model_args):
     ######################################
     dataset = get_dataset(script_args)
     tokenizer = get_tokenizer(model_args, training_args)
-    if True:
+    wrapper = True
+    if wrapper:
         # model_name = model_args.model_name_or_path.split('/')[-1]
         # model_args.attn_load_dir  = f"/home/stepyoun/projects/sparse-cot/attn_patterns/{model_name}/lr=0.02-reg=0.05-ctx=1000_16384-multi_passkey10"
         # model_args.sparsity = 0.5
@@ -249,7 +266,8 @@ def main(script_args, training_args, model_args):
         #     **model_kwargs,
         # )
         assert not training_args.gradient_checkpointing
-        model = SparseTransformerHybridModelWrapper.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+        model = SparseTransformerHybridModelWrapper.from_pretrained(model_args.model_name_or_path, **model_kwargs).model
+        sparse_attn_config = load_sparse_attn_config(model_args.model_name_or_path)
         # model.model.use_cache = False
         # if 'qwen' in model_args.model_name_or_path.lower():
         tokenizer.padding_side  = 'left'
@@ -277,8 +295,8 @@ def main(script_args, training_args, model_args):
     trainer = SFTTrainer(
         model=model,
         args=training_args,
-        train_dataset=dataset[script_args.dataset_train_split].select(range(16384)),
-        eval_dataset=(dataset[script_args.dataset_test_split].select(range(16384)) if training_args.eval_strategy != "no" else None),
+        train_dataset=dataset[script_args.dataset_train_split].select(range(8192)),
+        eval_dataset=(dataset[script_args.dataset_test_split].select(range(8192)) if training_args.eval_strategy != "no" else None),
         # train_dataset=dataset[script_args.dataset_train_split],
         # eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
         processing_class=tokenizer,
@@ -333,9 +351,69 @@ def main(script_args, training_args, model_args):
     # Align the model's generation config with the tokenizer's eos token
     # to avoid unbounded generation in the transformers `pipeline()` function
     # trainer.model.generation_config.eos_token_id = tokenizer.eos_token_id
-    trainer.model.model.generation_config.eos_token_id = tokenizer.eos_token_id
+    if wrapper:
+        # trainer.model.model.generation_config.eos_token_id = tokenizer.eos_token_id
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     trainer.save_model(training_args.output_dir)
+    save_config(sparse_attn_config, training_args.output_dir)
     logger.info(f"Model saved to {training_args.output_dir}")
+
+# ...existing code...
+
+    # # Reload trainer after saving the model (reload from output_dir)
+    # if wrapper:
+    #     from duo_attn.hybrid_model.hybrid_wrapper import SparseTransformerHybridModelWrapper
+    #     base_model = SparseTransformerHybridModelWrapper.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         torch_dtype=(
+    #             model_args.torch_dtype if model_args.torch_dtype in ["auto", None]
+    #             else getattr(torch, model_args.torch_dtype)
+    #         ),
+    #         use_cache=False,
+    #     )
+    #     # Keep EOS alignment for generation
+    #     base_model.model.generation_config.eos_token_id = tokenizer.eos_token_id
+    # else:
+    #     base_model = AutoModelForCausalLM.from_pretrained(
+    #         model_args.model_name_or_path,
+    #         torch_dtype=(
+    #             model_args.torch_dtype if model_args.torch_dtype in ["auto", None]
+    #             else getattr(torch, model_args.torch_dtype)
+    #         ),
+    #     )
+
+    # print(f"reloaded base_model:", base_model)
+
+# ...existing code...
+
+    # transformer.config["_name_or_path"] = sparse_attn_config["_name_or_path"]
+    if wrapper:
+        # dtype = torch.bfloat16
+        # base_model = SparseTransformerHybridModelWrapper.from_pretrained(
+        #     model_args.model_name_or_path,
+        #     torch_dtype=(
+        #         dtype
+        #     ),
+        #     use_cache=False,
+        # )
+        # base_model.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+        # print(f"reloaded base_model:", base_model)
+
+        hf_output_dir = os.path.join(training_args.output_dir, "hf")
+        os.makedirs(hf_output_dir, exist_ok=True)
+        # base_model.model.eval()
+        # # trainer.model.model.to(dtype)
+        # base_model.model.save_pretrained(hf_output_dir, safe_serialization=True)
+        # logging.info("Saving converted model to %s", hf_output_dir)
+        # tokenizer.save_pretrained(hf_output_dir)
+
+        trainer.model = trainer.model.model # remove wrapper when saving
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
+        trainer.save_model(hf_output_dir)
+        logger.info(f"Model saved to {hf_output_dir}")
+        logging.info("Tokenizer saved to %s", hf_output_dir)
+        save_config(sparse_attn_config, hf_output_dir)
+        logging.info("Model conversion complete.")
 
     # Save everything else on main process
     kwargs = {
